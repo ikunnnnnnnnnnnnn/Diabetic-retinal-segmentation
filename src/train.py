@@ -4,26 +4,23 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 
-from model import ResUNet  # 确保这个 UNet 类与你使用的匹配
-from data import DRDatasetPatched  # 确保这个 DRDataset 类与你使用的匹配
+from model import ResUNet  # Make sure this UNet class matches the one you are using
+from data import DRDataset  #  Make sure this DRDataset class matches the one you are using
 import tqdm
 import os
-import gc  # 导入垃圾回收模块
 
 import numpy as np
 
-from metrics import calculate_precision_recall, calculate_aupr, calculate_pr_curve  # 确保这个 metrics.py 与你使用的匹配
+from metrics import calculate_precision_recall, calculate_aupr, calculate_pr_curve  #  Make sure this metrics.py  matches the one you are using
 
 
 # --- Hyperparameters ---
-NUM_EPOCHS = 20
-BATCH_SIZE = 2  # 尝试减少 BATCH_SIZE
-PATCH_SIZE = (512, 512)  # 与 data.py 中的 patch_size 一致
-OVERLAP = 128  # 与 data.py 中的 overlap 一致
+NUM_EPOCHS = 50
+BATCH_SIZE = 4
 LEARNING_RATE = 0.001
 WEIGHT_DECAY = 1e-4
-NUM_WORKERS = 0  # 尝试减少 NUM_WORKERS，甚至设置为 0。
-IMAGE_SIZE = (2048, 2048)  # 这里使用原始图像的尺寸，或者一个较大的尺寸，保证能覆盖所有 patch
+NUM_WORKERS = 4
+IMAGE_SIZE = (512, 512)
 VAL_PERCENT = 0.1
 SAVE_CHECKPOINT = True
 CHECKPOINT_PATH = 'checkpoints/best_model.pth'
@@ -36,29 +33,15 @@ DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f'Using device: {DEVICE}')
 
 
-def create_datasets(images_dir, labels_dir, val_percent=0.1):
+def create_datasets(images_dir, labels_dir, val_percent=0.1, image_size=(512, 512)):
     """创建训练集和验证集."""
-    #  使用 DRDatasetPatched
-    train_dataset = DRDatasetPatched(
-        images_dir=images_dir,
-        labels_dir=labels_dir,
-        patch_size=PATCH_SIZE,
-        overlap=OVERLAP,
-        transform=None  # 你可以在这里添加数据增强
-    )
-    val_dataset = DRDatasetPatched(  # 验证集也要使用相同的 patch_size 和 overlap
-        images_dir=images_dir,
-        labels_dir=labels_dir,
-        patch_size=PATCH_SIZE,
-        overlap=OVERLAP,
-        transform=None  # 验证集上通常不进行数据增强
-    )
-    dataset_size = len(train_dataset)  # 使用 train_dataset 的长度，因为验证集和训练集长度不一致了
+    dataset = DRDataset(images_dir=images_dir, labels_dir=labels_dir, target_size=image_size)
+    dataset_size = len(dataset)
     val_size = int(val_percent * dataset_size)
     train_indices = list(range(dataset_size - val_size))
     val_indices = list(range(dataset_size - val_size, dataset_size))
-    train_dataset = Subset(train_dataset, train_indices)
-    val_dataset = Subset(val_dataset, val_indices)
+    train_dataset = Subset(dataset, train_indices)
+    val_dataset = Subset(dataset, val_indices)
     return train_dataset, val_dataset
 
 
@@ -70,7 +53,7 @@ def create_data_loaders(train_dataset, val_dataset, batch_size=4, num_workers=4)
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True  # 设置为 False，处理最后一个 batch
+        drop_last=True
     )
     val_loader = DataLoader(
         val_dataset,
@@ -78,9 +61,10 @@ def create_data_loaders(train_dataset, val_dataset, batch_size=4, num_workers=4)
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=False  # 设置为 False，处理最后一个 batch
+        drop_last=False
     )
     return train_loader, val_loader
+
 
 
 def calculate_class_weights(train_loader, num_classes, device):
@@ -93,11 +77,11 @@ def calculate_class_weights(train_loader, num_classes, device):
         for i in range(num_classes):
             class_counts[i] += torch.sum(labels == i)
         total_pixels += torch.prod(torch.tensor(labels.shape, dtype=torch.float)).item()
-        del labels  # 显式删除不再需要的变量
-        torch.cuda.empty_cache()  # 释放 GPU 缓存
+
     weights = total_pixels / (class_counts + 1e-6)
     weights /= weights.sum()
     return weights
+
 
 
 def weighted_cross_entropy_loss(outputs, targets, weights):
@@ -105,6 +89,7 @@ def weighted_cross_entropy_loss(outputs, targets, weights):
     loss = F.cross_entropy(outputs, targets, reduction='none')
     loss = loss * weights[targets]
     return torch.mean(loss)
+
 
 
 def dice_loss(outputs, targets, smooth=1e-6):
@@ -120,9 +105,9 @@ def dice_loss(outputs, targets, smooth=1e-6):
     return 1 - dice.mean()
 
 
+
 class MixedLoss(nn.Module):
     """混合损失，结合交叉熵和 Dice 损失."""
-
     def __init__(self, alpha=0.5, use_weights=True):
         super(MixedLoss, self).__init__()
         self.alpha = alpha
@@ -136,6 +121,7 @@ class MixedLoss(nn.Module):
         return self.alpha * ce_loss + (1 - self.alpha) * dc_loss
 
 
+
 def train_one_epoch(model, optimizer, criterion, train_loader, device, epoch, class_weights, scaler,
                     accumulation_steps):
     """训练一个epoch."""
@@ -146,15 +132,17 @@ def train_one_epoch(model, optimizer, criterion, train_loader, device, epoch, cl
         images = images.to(device)
         labels = labels.to(device, dtype=torch.long)
 
-        # 检查图像和标签的大小
-        if images.size(2) != PATCH_SIZE[0] or images.size(3) != PATCH_SIZE[1]:
-            print(f"Skipping batch {batch_idx} with mismatched size: {images.size()}")
-            continue  # Skip this batch
-
         with torch.amp.autocast(device_type='cuda', enabled=USE_AMP):  # 混合精度
-            outputs = model(images)  # 现在 outputs 在这里被赋值
+            outputs = model(images)
             labels = torch.argmax(labels, dim=1)
-
+            # print("Outputs shape:", outputs.shape)
+            # print("Outputs dtype:", outputs.dtype)
+            # print("Labels shape:", labels.shape)
+            # print("Labels dtype:", labels.dtype)
+            # print("Outputs min:", torch.min(outputs))
+            # print("Outputs max:", torch.max(outputs))
+            # print("Labels min:", torch.min(labels))
+            # print("Labels max:", torch.max(labels))
             loss = criterion(outputs, labels, class_weights)
             loss = loss / accumulation_steps  # 梯度累积
 
@@ -167,8 +155,7 @@ def train_one_epoch(model, optimizer, criterion, train_loader, device, epoch, cl
 
         epoch_loss += loss.item() * accumulation_steps
         loop.set_postfix(loss=loss.item())
-        del images, labels, outputs  # 显式删除不再需要的变量
-        torch.cuda.empty_cache()  # 释放 GPU 缓存
+
     epoch_loss /= len(train_loader)
     print(f'Epoch [{epoch + 1}/{NUM_EPOCHS}], Training Loss: {epoch_loss:.4f}')
     return epoch_loss
@@ -187,13 +174,8 @@ def validate_one_epoch(model, criterion, val_loader, device, epoch, output_dir='
             images = images.to(device)
             labels = labels.to(device, dtype=torch.long)
 
-             # 检查图像和标签的大小
-            if images.size(2) != PATCH_SIZE[0] or images.size(3) != PATCH_SIZE[1]:
-                print(f"Skipping batch with mismatched size: {images.size()}")
-                continue  # Skip this batch
-
             with torch.amp.autocast(device_type='cuda', enabled=USE_AMP):  # 混合精度
-                outputs = model(images)  # 现在 outputs 在这里被赋值
+                outputs = model(images)
                 labels = torch.argmax(labels, dim=1)
                 loss = criterion(outputs, labels)  # 不传递 weights
 
@@ -201,8 +183,6 @@ def validate_one_epoch(model, criterion, val_loader, device, epoch, output_dir='
 
             all_predictions.append(outputs.cpu())
             all_targets.append(labels.cpu())
-            del images, labels, outputs  # 显式删除不再需要的变量
-            torch.cuda.empty_cache()  # 释放 GPU 缓存
 
     val_loss /= len(val_loader)
     print(f'Epoch [{epoch + 1}/{NUM_EPOCHS}], Validation Loss: {val_loss:.4f}')
@@ -217,10 +197,9 @@ def validate_one_epoch(model, criterion, val_loader, device, epoch, output_dir='
         pr_data, pr_curve_fig = calculate_pr_curve(all_predictions, all_targets, num_classes)
         pr_curve_fig.savefig(pr_curve_path)
         print(f' P-R Curve saved to {pr_curve_path}')
-        del pr_data, pr_curve_fig
-        torch.cuda.empty_cache()
 
     return val_loss
+
 
 
 def save_model(model, path, val_loss, best_val_loss, save_checkpoint=True):
@@ -232,6 +211,7 @@ def save_model(model, path, val_loss, best_val_loss, save_checkpoint=True):
     return best_val_loss
 
 
+
 if __name__ == '__main__':
     # --- Data Loading ---
     train_images_dir = r'D:\DR2\data\train\images'  # 替换为你的训练图像目录
@@ -240,11 +220,11 @@ if __name__ == '__main__':
     os.makedirs('checkpoints', exist_ok=True)
     os.makedirs(output_dir, exist_ok=True)
 
-    #  使用 DRDatasetPatched
     train_dataset, val_dataset = create_datasets(
         images_dir=train_images_dir,  # 使用 train_images_dir
         labels_dir=train_labels_dir,  # 使用 train_labels_dir
-        # image_size=IMAGE_SIZE  # 注释掉 image_size，DRDatasetPatched 不接受这个参数
+        val_percent=VAL_PERCENT,
+        image_size=IMAGE_SIZE
     )
 
     train_loader, val_loader = create_data_loaders(
@@ -255,7 +235,7 @@ if __name__ == '__main__':
     )
 
     # --- Model, Loss, Optimizer ---
-    model = ResUNet(in_channels=3, out_channels=5).to(DEVICE)  # 确保 in_channels 和 out_channels 与你的数据集匹配
+    model = ResUNet(in_channels=3, out_channels=5).to(DEVICE)  #  Make sure the  in_channels and out_channels  match your dataset.
     criterion = MixedLoss(alpha=0.5, use_weights=True).to(DEVICE)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scaler = torch.amp.GradScaler(enabled=USE_AMP)  # 混合精度
@@ -263,12 +243,10 @@ if __name__ == '__main__':
     # --- Training Loop ---
     best_val_loss = float('inf')
     for epoch in range(NUM_EPOCHS):
-        class_weights = calculate_class_weights(train_loader, num_classes=5, device=DEVICE)  # 这里的 num_classes 要和你的模型输出通道数一致
+        class_weights = calculate_class_weights(train_loader, num_classes=5, device=DEVICE)  #这里的  num_classes  要和你的模型输出通道数一致
         train_loss = train_one_epoch(model, optimizer, criterion, train_loader, DEVICE, epoch, class_weights, scaler,
                                     ACCUMULATION_STEPS)
         val_loss = validate_one_epoch(model, criterion, val_loader, DEVICE, epoch, output_dir)
         best_val_loss = save_model(model, CHECKPOINT_PATH, val_loss, best_val_loss, SAVE_CHECKPOINT)
-        gc.collect()  # 手动进行垃圾回收
-        torch.cuda.empty_cache()  # 释放 GPU 缓存
 
     print('Training finished!')
