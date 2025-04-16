@@ -1,0 +1,6 @@
+Test Loss: 0.9122
+Test Precision: 0.0464, Recall: 0.6643
+ Class_1: 0.4507
+ Class_2: 0.0909
+ Class_3: 0.1257
+ Class_4: 0.3438
